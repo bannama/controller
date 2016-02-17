@@ -71,7 +71,7 @@ public class WoPublisher {
 			headers.put("type", getType(type));
 			headers.put("msgId", id);
 			MessageData data = new MessageData(payload, headers);
-			asyncSearchPublisher.executeAsync(data);
+			asyncSearchPublisher.publishAsync(data);
 			if (cmsWoSimpleBase instanceof CmsWorkOrderSimple) {
 				logger.info("WO published to search stream queue for RfcId: "
 						+ ((CmsWorkOrderSimple) cmsWoSimpleBase).getRfcId());
