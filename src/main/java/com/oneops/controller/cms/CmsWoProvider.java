@@ -45,11 +45,15 @@ import com.oneops.cms.simple.domain.CmsWorkOrderSimple;
 import com.oneops.cms.util.CmsError;
 import com.oneops.cms.util.CmsUtil;
 import com.oneops.cms.util.domain.AttrQueryCondition;
+
+import org.apache.commons.lang.StringUtils;
 import org.apache.log4j.Logger;
 
+import java.lang.reflect.Type;
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static com.oneops.cms.util.CmsConstants.*;
 
@@ -66,6 +70,8 @@ public class CmsWoProvider {
     private static final String IS_PLATFORM_ENABLED_REL_ATTR = "enabled";
     private static final String EXTRA_RUNLIST_PAYLOAD_NAME = "ExtraRunList";
     private static final boolean OFFERING_ENABLED = "true".equals(System.getProperty("controller.offerings.on", "true"));
+    private static final String COMPONENT_PAYLOAD_CONF = "wo_payload";
+    private static final String COMPONENT_PAYLOAD_KEY_ALL = "all";
     private DJDpmtMapper dpmtMapper;
     private OpsMapper opsMapper;
     private CmsCmRfcMrgProcessor cmrfcProcessor;
@@ -346,38 +352,67 @@ public class CmsWoProvider {
 
         CmsRfcCI rfcNaked = djMapper.getRfcCIById(workOrder.getRfcId());
         CmsRfcCI rfcCimerged = cmrfcProcessor.getCiById(rfcNaked.getCiId(), "df");
-
+        Context context = new Context();
+        context.workOrder = workOrder;
         workOrder.setRfcCi(rfcCimerged);
         populateWoBase(workOrder);
-
 
         Map<Long, CmsCI> manifestToTemplateMap = new HashMap<>();
 
         CmsCI env = getEnvAndPopulatePlatEnable(workOrder.getBox());
 
-        Map<String, String> globalVars = cmsUtil.getGlobalVars(env);
-        Map<String, String> cloudVars = cmsUtil.getCloudVars(workOrder.getCloud());
-        Map<String, String> localVars = cmsUtil.getLocalVars(workOrder.getBox());
-
-        workOrder.putPayLoadEntry(CmsUtil.CLOUD_VARS_PAYLOAD_NAME, cmsUtil.getCloudVarsRfcs(workOrder.getCloud()));
-        workOrder.putPayLoadEntry(CmsUtil.GLOBAL_VARS_PAYLOAD_NAME, cmsUtil.getGlobalVarsRfcs(env));
-        workOrder.putPayLoadEntry(CmsUtil.LOCAL_VARS_PAYLOAD_NAME, cmsUtil.getLocalVarsRfcs(workOrder.getBox()));
-
         //basic staff
         //put realized as
-        workOrder.putPayLoadEntry("RealizedAs", getRfcCIRelatives(workOrder.getRfcCi(), "base.RealizedAs", "to", null, "df"));
+        workOrder.putPayLoadEntry("RealizedAs", getRfcCIRelatives(workOrder.getRfcCi(), "base.RealizedAs", "to", null, "df"));	
+
+        long manifestCiId = workOrder.getPayLoad().get("RealizedAs").get(0).getCiId();
+        if (!manifestToTemplateMap.containsKey(manifestCiId)) {
+            CmsCI manifestCi = cmProcessor.getCiById(manifestCiId);
+            CmsCI templObj = cmProcessor.getTemplateObjForManifestObj(manifestCi, env);
+            if (templObj == null) {
+                logger.error("Can not find manifest template object for manifest ci id = " + manifestCi.getCiId() + " ciName" + manifestCi.getCiName());
+            } else {
+                manifestToTemplateMap.put(manifestCi.getCiId(), templObj);
+                findPayloadConfForComponent(context, templObj);
+            }
+        }
+
+        if (context.excludePayload == null) {
+            context.excludePayload = Collections.emptySet();
+        }
+        if (context.includePayload == null) {
+            context.includePayload = Collections.emptySet();
+        }
+
+        //the payload sections that can be included/excluded by component level payload config
+        //OO_*_VARS, Assembly, Organization, DependsOn, Entrypoint, ServicedBy, RequiresComputes
+
+        List<CmsRfcCI> globalVarsRfc = cmsUtil.getGlobalVarsRfcs(env);
+        Map<String, String> globalVars = cmsUtil.getVarValuesMap(globalVarsRfc);
+
+        List<CmsRfcCI> cloudVarsRfc = cmsUtil.getCloudVarsRfcs(workOrder.getCloud());
+        Map<String, String> cloudVars = cmsUtil.getVarValuesMap(cloudVarsRfc);
+
+        List<CmsRfcCI> localVarsRfc = cmsUtil.getLocalVarsRfcs(workOrder.getCloud());
+        Map<String, String> localVars = cmsUtil.getVarValuesMap(localVarsRfc);
+
+        addVarsIfNeeded(globalVarsRfc, cloudVarsRfc, localVarsRfc, context);
 
         //put env
         List<CmsRfcCI> envs = getRfcCIRelatives(workOrder.getBox().getCiId(), "manifest.ComposedOf", "to", null, "df");
         workOrder.putPayLoadEntry("Environment", envs);
 
         //put assembly
-        List<CmsRfcCI> assemblys = getRfcCIRelatives(workOrder.getPayLoad().get("Environment").get(0), "base.RealizedIn", "to", null, "df");
-        workOrder.putPayLoadEntry("Assembly", assemblys);
+        if (includeInPayload(context, "Assembly")) {
+            List<CmsRfcCI> assemblys = getRfcCIRelatives(workOrder.getPayLoad().get("Environment").get(0), "base.RealizedIn", "to", null, "df");
+            workOrder.putPayLoadEntry("Assembly", assemblys);
+        }
 
         //put Organization
-        List<CmsRfcCI> orgs = getRfcCIRelatives(workOrder.getPayLoad().get("Assembly").get(0), "base.Manages", "to", null, "df");
-        workOrder.putPayLoadEntry("Organization", orgs);
+        if (includeInPayload(context, "Organization")) {
+            List<CmsRfcCI> orgs = getRfcCIRelatives(workOrder.getPayLoad().get("Assembly").get(0), "base.Manages", "to", null, "df");
+            workOrder.putPayLoadEntry("Organization", orgs);
+        }
 
         //put watchedBy and loggedBy
         if (workOrder.getPayLoad().get("RealizedAs").size() > 0) {
@@ -387,19 +422,7 @@ public class CmsWoProvider {
         }
 
         // now lets process the custom payloads and this will override the default ones as well
-
         //lets get the payload def from the template
-        long manifestCiId = workOrder.getPayLoad().get("RealizedAs").get(0).getCiId();
-        if (!manifestToTemplateMap.containsKey(manifestCiId)) {
-            CmsCI manifestCi = cmProcessor.getCiById(manifestCiId);
-            CmsCI templObj = cmProcessor.getTemplateObjForManifestObj(manifestCi, env);
-            if (templObj == null) {
-                logger.error("Can not find manifest template object for manifest ci id = " + manifestCi.getCiId() + " ciName" + manifestCi.getCiName());
-            } else {
-                manifestToTemplateMap.put(manifestCi.getCiId(), templObj);
-            }
-        }
-
         if (!manifestToTemplateMap.containsKey(manifestCiId)) {
             //throw new DJException(CmsError.CMS_CANT_FIGURE_OUT_TEMPLATE_FOR_MANIFEST_ERROR,
         	//Don't throw an exception in case no pack component could be found.
@@ -416,24 +439,23 @@ public class CmsWoProvider {
         }
 
         //put depends on
-        if (!workOrder.getPayLoad().containsKey(DEPENDS_ON)) {
+        if (includeInPayload(context, DEPENDS_ON)) {
             workOrder.putPayLoadEntry(DEPENDS_ON, getRfcCIRelatives(workOrder.getRfcCi(), "bom.DependsOn", "from", null, "df"));
         }
 
         //put Entrypoint
-        if (!workOrder.getPayLoad().containsKey(ENTRYPOINT)) {
+        if (includeInPayload(context, ENTRYPOINT)) {
             workOrder.putPayLoadEntry(ENTRYPOINT, getRfcCIRelatives(workOrder.getRfcCi(), "base.Entrypoint", "to", null, "df"));
         }
         //put mgmt key pairs
-        if (!workOrder.getPayLoad().containsKey(SECURED_BY)) {
-            workOrder.putPayLoadEntry(SECURED_BY, getKeyPairsRfc(workOrder.getRfcCi(), workOrder.getPayLoad().get("ManagedVia")));
-        }
+        workOrder.putPayLoadEntry(SECURED_BY, getKeyPairsRfc(workOrder.getRfcCi(), workOrder.getPayLoad().get("ManagedVia")));
+
         //put serviecedBy
-        if (!workOrder.getPayLoad().containsKey(SERVICED_BY)) {
+        if (includeInPayload(context, SERVICED_BY) ) {
             workOrder.putPayLoadEntry(SERVICED_BY, getServicedBy(workOrder.getRfcCi()));
         }
         //put RequiresComputes
-        if (!workOrder.getPayLoad().containsKey(REQUIRES_COMPUTES_PAYLOAD_NAME)) {
+        if (includeInPayload(context, REQUIRES_COMPUTES_PAYLOAD_NAME)) {
             workOrder.putPayLoadEntry(REQUIRES_COMPUTES_PAYLOAD_NAME, getRequiresComputes(workOrder.getRfcCi()));
         }
 
@@ -455,6 +477,55 @@ public class CmsWoProvider {
         return workOrder;
     }
 
+    private void findPayloadConfForComponent(Context context, CmsCI templateCi) {
+        CmsCIAttribute woPayloadAttr = templateCi.getAttribute(COMPONENT_PAYLOAD_CONF);
+        if (woPayloadAttr != null) {
+            String includeAttr = null;
+            String excludeAttr = null;
+            String payloadVal = woPayloadAttr.getDfValue();
+            if (StringUtils.isNotBlank(payloadVal)) {
+                Type type = new TypeToken<Map<String, PayloadConf>>(){}.getType();
+                Map<String, PayloadConf> payloadMap = gson.fromJson(payloadVal, type);
+                if (payloadMap != null) {
+                    String rfcAction = context.workOrder.getRfcCi().getRfcAction();
+                    String key = payloadMap.containsKey(rfcAction) ? rfcAction : 
+                        (payloadMap.containsKey(COMPONENT_PAYLOAD_KEY_ALL) ? COMPONENT_PAYLOAD_KEY_ALL : null);
+                    if (StringUtils.isNotEmpty(key)) {
+                        PayloadConf conf = payloadMap.get(key);
+                        excludeAttr = conf.exclude;
+                        includeAttr = conf.include;
+                    }
+                }
+                if (StringUtils.isNotBlank(excludeAttr)) {
+                    context.excludePayload = Stream.of(excludeAttr.split(",")).map(String::trim).collect(Collectors.toSet());
+                }
+                if (StringUtils.isNotBlank(includeAttr)) {
+                    context.includePayload = Stream.of(includeAttr.split(",")).map(String::trim).collect(Collectors.toSet());
+                }
+                logger.info(" rfcCi " + context.workOrder.getRfcId() + " : includePayload " + context.includePayload + ", excludePayload " + context.excludePayload);
+            }
+        }
+    }
+
+    private void addVarsIfNeeded(List<CmsRfcCI> globalVarsRfc, List<CmsRfcCI> cloudVarsRfc, List<CmsRfcCI> localVarsRfc, Context context) {
+        if (includeInPayload(context, CmsUtil.CLOUD_VARS_PAYLOAD_NAME)) {
+            context.workOrder.putPayLoadEntry(CmsUtil.CLOUD_VARS_PAYLOAD_NAME, cloudVarsRfc);
+        }
+        if (includeInPayload(context, CmsUtil.GLOBAL_VARS_PAYLOAD_NAME)) {
+            context.workOrder.putPayLoadEntry(CmsUtil.GLOBAL_VARS_PAYLOAD_NAME, globalVarsRfc);
+        }
+        if (includeInPayload(context, CmsUtil.LOCAL_VARS_PAYLOAD_NAME)) {
+            context.workOrder.putPayLoadEntry(CmsUtil.LOCAL_VARS_PAYLOAD_NAME, localVarsRfc);
+        }
+    }
+
+    private boolean includeInPayload(Context context, String key) {
+        if (context.workOrder.getPayLoad().containsKey(key) || context.excludePayload.contains(key) || 
+                (!context.includePayload.isEmpty() && !context.includePayload.contains(key))) {
+            return false;
+        }
+        return true;
+    }
 
     private List<CmsRfcCI> getRequiredOfferings(CmsWorkOrder workOrder) {
 
@@ -892,6 +963,17 @@ public class CmsWoProvider {
 
     public void setExpressionEvaluator(ExpressionEvaluator expressionEvaluator) {
         this.expressionEvaluator = expressionEvaluator;
+    }
+
+    class Context {
+        Set<String> includePayload;
+        Set<String> excludePayload;
+        CmsWorkOrder workOrder;
+    }
+
+    class PayloadConf {
+        String include;
+        String exclude;
     }
 
 }
